@@ -6,6 +6,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { PTY_TICKET_TIMEOUT_MS } from "@/lib/pty-reconnect";
 
+let capturedKeyHandler:
+  | ((event: KeyboardEvent) => boolean)
+  | null = null;
+
 class FakeFitAddon {
   fit() {}
 }
@@ -29,7 +33,8 @@ class FakeTerminal {
     this.options = options;
   }
 
-  attachCustomKeyEventHandler() {
+  attachCustomKeyEventHandler(handler: (event: KeyboardEvent) => boolean) {
+    capturedKeyHandler = handler;
     return true;
   }
 
@@ -190,6 +195,7 @@ async function render(ui: ReactNode) {
 }
 
 beforeEach(() => {
+  capturedKeyHandler = null;
   FakeWebSocket.instances = [];
   maybeReloadForLoopbackWsAuthFailure.mockClear();
   apiMocks.buildWsUrl.mockReset();
@@ -255,6 +261,37 @@ afterEach(async () => {
 });
 
 describe("ChatPage", () => {
+  it("leaves plain macOS Cmd+V to native browser paste", async () => {
+    Object.defineProperty(window.navigator, "platform", {
+      configurable: true,
+      value: "MacIntel",
+    });
+    const readText = vi.fn(async () => "clipboard text");
+    Object.defineProperty(window.navigator, "clipboard", {
+      configurable: true,
+      value: { readText, writeText: vi.fn(async () => {}) },
+    });
+    const { default: ChatPage } = await import("./ChatPage");
+
+    await render(
+      <MemoryRouter initialEntries={["/chat"]}>
+        <ChatPage isActive />
+      </MemoryRouter>,
+    );
+
+    expect(capturedKeyHandler).not.toBeNull();
+    const handledByXterm = capturedKeyHandler!(
+      new KeyboardEvent("keydown", {
+        bubbles: true,
+        key: "v",
+        metaKey: true,
+      }),
+    );
+
+    expect(handledByXterm).toBe(true);
+    expect(readText).not.toHaveBeenCalled();
+  });
+
   it("treats loopback 4401 closes as stale-token reload candidates", async () => {
     const { default: ChatPage } = await import("./ChatPage");
 

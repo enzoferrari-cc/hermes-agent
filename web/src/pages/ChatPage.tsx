@@ -690,12 +690,11 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       // as SIGINT.
       // Paste: Cmd+Shift+V on macOS, Ctrl+Shift+V on others.
       const copyModifier = isMac ? ev.metaKey : ev.ctrlKey;
-      // Paste on BARE Ctrl+V too (not only Ctrl+Shift+V). Bare Ctrl+V otherwise
-      // falls through to the TUI, whose server-side clipboard read can't see the
-      // browser/OS clipboard → "No image found in clipboard". Routing Ctrl+V
-      // through the same navigator.clipboard path below makes it paste
-      // image-or-text correctly, like Ctrl+Shift+V.
-      const pasteModifier = isMac ? ev.metaKey : ev.ctrlKey;
+      // Paste on bare Ctrl+V too (not only Ctrl+Shift+V) outside macOS. On macOS,
+      // leave plain Cmd+V to xterm/browser-native paste, which remains reliable
+      // when the WebUI is embedded in an iframe; Cmd+Shift+V keeps the explicit
+      // navigator.clipboard image-or-text path below.
+      const pasteModifier = isMac ? ev.metaKey && ev.shiftKey : ev.ctrlKey;
 
       const terminalSelection = term.getSelection();
       const shortcut = resolvePtyKeyboardShortcut(
