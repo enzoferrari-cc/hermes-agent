@@ -70,6 +70,26 @@ def _normalize_cwd_for_compare(cwd: str | None) -> str:
         return os.path.normpath(expanded)
 
 
+def _row_cwd(row: Dict[str, Any]) -> str:
+    """Resolve a session workspace across the CLI and ACP storage formats."""
+    column = str(row.get("cwd") or "").strip()
+    if column:
+        return column
+
+    mc = row.get("model_config")
+    if mc:
+        try:
+            meta = json.loads(mc)
+            if isinstance(meta, dict):
+                packed = str(meta.get("cwd") or "").strip()
+                if packed:
+                    return packed
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    return "."
+
+
 def _build_session_title(title: Any, preview: Any, cwd: str | None) -> str:
     explicit = str(title or "").strip()
     if explicit:
@@ -172,6 +192,7 @@ class SessionState:
 
     session_id: str
     agent: Any  # AIAgent instance
+    source: str = "acp"
     cwd: str = "."
     model: str = ""
     history: List[Dict[str, Any]] = field(default_factory=list)
@@ -244,6 +265,9 @@ class SessionManager:
     def remove_session(self, session_id: str) -> bool:
         """Remove a session from memory and database. Returns True if it existed."""
         with self._lock:
+            state = self._sessions.get(session_id)
+            if state is not None and state.source != "acp":
+                return False
             existed = self._sessions.pop(session_id, None) is not None
         db_existed = self._delete_persisted(session_id)
         if existed or db_existed:
@@ -288,10 +312,12 @@ class SessionManager:
 
         if db is not None:
             try:
-                for row in db.list_sessions_rich(source="acp", limit=1000):
+                # Discovery spans interfaces. Cleanup remains ACP-only because it
+                # deletes rows and must not reach sessions another interface owns.
+                for row in db.list_sessions_rich(limit=1000):
                     persisted_rows[str(row["id"])] = dict(row)
             except Exception:
-                logger.debug("Failed to load ACP sessions from DB", exc_info=True)
+                logger.debug("Failed to load persisted sessions from DB", exc_info=True)
 
         # Collect in-memory sessions first.
         with self._lock:
@@ -332,14 +358,7 @@ class SessionManager:
             message_count = int(row.get("message_count") or 0)
             if message_count <= 0:
                 continue
-            # Extract cwd from model_config JSON.
-            session_cwd = "."
-            mc = row.get("model_config")
-            if mc:
-                try:
-                    session_cwd = json.loads(mc).get("cwd", ".")
-                except (json.JSONDecodeError, TypeError):
-                    pass
+            session_cwd = _row_cwd(row)
             if normalized_cwd and _normalize_cwd_for_compare(session_cwd) != normalized_cwd:
                 continue
             results.append({
@@ -368,11 +387,12 @@ class SessionManager:
     def cleanup(self) -> None:
         """Remove all sessions (memory and database) and clear task-specific cwd overrides."""
         with self._lock:
-            session_ids = list(self._sessions.keys())
+            sessions = list(self._sessions.items())
             self._sessions.clear()
-        for session_id in session_ids:
+        for session_id, state in sessions:
             _clear_task_cwd(session_id)
-            self._delete_persisted(session_id)
+            if state.source == "acp":
+                self._delete_persisted(session_id)
         # Also remove any DB-only ACP sessions not currently in memory.
         db = self._get_db()
         if db is not None:
@@ -523,12 +543,9 @@ class SessionManager:
         if row is None:
             return None
 
-        # Only restore ACP sessions.
-        if row.get("source") != "acp":
-            return None
-
-        # Extract cwd from model_config.
-        cwd = "."
+        # Sessions are shared across interfaces. The source records provenance,
+        # not whether the ACP adapter may resume the persisted conversation.
+        cwd = _row_cwd(row)
         requested_provider = row.get("billing_provider")
         restored_base_url = row.get("billing_base_url")
         restored_api_mode = None
@@ -537,7 +554,6 @@ class SessionManager:
             try:
                 meta = json.loads(mc)
                 if isinstance(meta, dict):
-                    cwd = meta.get("cwd", ".")
                     requested_provider = meta.get("provider") or requested_provider
                     restored_base_url = meta.get("base_url") or restored_base_url
                     restored_api_mode = meta.get("api_mode") or restored_api_mode
@@ -575,6 +591,7 @@ class SessionManager:
         state = SessionState(
             session_id=session_id,
             agent=agent,
+            source=str(row.get("source") or ""),
             cwd=cwd,
             model=model or getattr(agent, "model", "") or "",
             history=history,
@@ -587,11 +604,14 @@ class SessionManager:
         return state
 
     def _delete_persisted(self, session_id: str) -> bool:
-        """Delete a session from the database. Returns True if it existed."""
+        """Delete an ACP-owned session from the database."""
         db = self._get_db()
         if db is None:
             return False
         try:
+            row = db.get_session(session_id)
+            if row is None or row.get("source") != "acp":
+                return False
             return db.delete_session(session_id)
         except Exception:
             logger.debug("Failed to delete ACP session %s from DB", session_id, exc_info=True)

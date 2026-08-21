@@ -210,6 +210,25 @@ class TestListAndCleanup:
     def test_list_sessions_empty(self, manager):
         assert manager.list_sessions() == []
 
+    def test_list_sessions_includes_cli_session_for_workspace(self, manager):
+        db = manager._get_db()
+        db.create_session(
+            session_id="cli-session-list",
+            source="cli",
+            model="test",
+            cwd="/work/project",
+        )
+        db.append_message(
+            session_id="cli-session-list",
+            role="user",
+            content="created from the TUI",
+        )
+
+        listed = manager.list_sessions(cwd="/work/project")
+
+        assert [session["session_id"] for session in listed] == ["cli-session-list"]
+        assert listed[0]["cwd"] == "/work/project"
+
 
 
     def test_save_session_preserves_existing_messages_on_encode_failure(self, manager):
@@ -252,6 +271,26 @@ class TestListAndCleanup:
         manager.cleanup()
         assert manager.list_sessions() == []
 
+    def test_cleanup_does_not_delete_restored_cli_session(self, manager):
+        db = manager._get_db()
+        db.create_session(
+            session_id="cli-session-cleanup",
+            source="cli",
+            model="test",
+            cwd="/work/project",
+        )
+        db.append_message(
+            session_id="cli-session-cleanup",
+            role="user",
+            content="owned by the CLI",
+        )
+        assert manager.get_session("cli-session-cleanup") is not None
+
+        manager.cleanup()
+
+        assert db.get_session("cli-session-cleanup") is not None
+        assert db.get_messages_as_conversation("cli-session-cleanup")
+
     def test_remove_session(self, manager):
         state = manager.create_session()
         assert manager.remove_session(state.session_id) is True
@@ -281,13 +320,45 @@ class TestPersistence:
 
 
 
-    def test_only_restores_acp_sessions(self, manager):
-        """get_session should not restore non-ACP sessions from DB."""
+    def test_restores_cli_session_with_its_workspace(self, manager):
         db = manager._get_db()
-        # Manually create a CLI session in the DB.
-        db.create_session(session_id="cli-session-123", source="cli", model="test")
-        # Should not be found via ACP SessionManager.
-        assert manager.get_session("cli-session-123") is None
+        db.create_session(
+            session_id="cli-session-123",
+            source="cli",
+            model="test",
+            cwd="/work/project",
+        )
+        db.append_message(
+            session_id="cli-session-123",
+            role="user",
+            content="resume this history",
+        )
+
+        restored = manager.get_session("cli-session-123")
+
+        assert restored is not None
+        assert restored.source == "cli"
+        assert restored.cwd == "/work/project"
+        assert restored.history[0]["content"] == "resume this history"
+
+    def test_remove_does_not_delete_restored_cli_session(self, manager):
+        db = manager._get_db()
+        db.create_session(
+            session_id="cli-session-remove",
+            source="cli",
+            model="test",
+            cwd="/work/project",
+        )
+        db.append_message(
+            session_id="cli-session-remove",
+            role="user",
+            content="owned by the CLI",
+        )
+        assert manager.get_session("cli-session-remove") is not None
+
+        assert manager.remove_session("cli-session-remove") is False
+        assert db.get_session("cli-session-remove") is not None
+        assert db.get_messages_as_conversation("cli-session-remove")
 
     def test_sessions_searchable_via_fts(self, manager):
         """ACP sessions stored in SessionDB are searchable via FTS5."""
