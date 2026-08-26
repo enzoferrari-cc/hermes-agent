@@ -509,6 +509,20 @@ def _embedded_resource_to_parts(block: EmbeddedResourceContentBlock) -> list[dic
     return []
 
 
+def _client_system_prompt_from_meta(request_meta: Any) -> str | None:
+    """Read ``_meta.hermes.systemPrompt`` off an ACP request.
+
+    The SDK router splats ``_meta`` entries into handler kwargs, so a client that
+    sends ``{"_meta": {"hermes": {"systemPrompt": "..."}}}`` arrives here as the
+    ``hermes`` kwarg. ``None`` means the client did not provide this metadata;
+    an empty string explicitly clears a previously supplied client prompt.
+    """
+    if not isinstance(request_meta, dict) or "systemPrompt" not in request_meta:
+        return None
+    value = request_meta["systemPrompt"]
+    return value.strip() if isinstance(value, str) else None
+
+
 def _extract_text(
     prompt: list[
         TextContentBlock
@@ -1808,6 +1822,8 @@ class HermesACPAgent(acp.Agent):
         if not has_content:
             return PromptResponse(stop_reason="end_turn")
 
+        client_system_prompt = _client_system_prompt_from_meta(kwargs.get("hermes"))
+
         # /steer on an idle session has no in-flight tool call to inject into.
         # Rewrite it so the payload runs as a normal user prompt, matching the
         # gateway's behavior (gateway/run.py ~L4898). Two sub-cases:
@@ -1891,6 +1907,11 @@ class HermesACPAgent(acp.Agent):
                     )
                     is True
                     and hasattr(state.agent, "redirect")
+                    and (
+                        client_system_prompt is None
+                        or (client_system_prompt or None)
+                        == getattr(state.agent, "ephemeral_system_prompt", None)
+                    )
                 ):
                     try:
                         redirected = bool(state.agent.redirect(user_content))
@@ -1902,7 +1923,13 @@ class HermesACPAgent(acp.Agent):
                         )
                 if not redirected:
                     queued_text = user_text or "[Image attachment]"
-                    state.queued_prompts.append(queued_text)
+                    queued_prompt: str | dict[str, Any] = queued_text
+                    if client_system_prompt is not None:
+                        queued_prompt = {
+                            "text": queued_text,
+                            "client_system_prompt": client_system_prompt,
+                        }
+                    state.queued_prompts.append(queued_prompt)
                     queued_depth = len(state.queued_prompts)
             else:
                 state.is_running = True
@@ -1977,6 +2004,8 @@ class HermesACPAgent(acp.Agent):
             approval_cb = None
 
         agent = state.agent
+        if client_system_prompt is not None:
+            agent.ephemeral_system_prompt = client_system_prompt or None
         agent.tool_progress_callback = tool_progress_cb
         # ACP thought panes should not receive Hermes' local kawaii waiting/status
         # updates. Route provider/model reasoning deltas instead; if the provider
@@ -2192,15 +2221,27 @@ class HermesACPAgent(acp.Agent):
             with state.runtime_lock:
                 if not state.queued_prompts:
                     break
-                next_prompt = state.queued_prompts.pop(0)
+                queued_prompt = state.queued_prompts.pop(0)
+            next_client_system_prompt: str | None = None
+            if isinstance(queued_prompt, dict):
+                next_prompt = str(queued_prompt.get("text") or "")
+                value = queued_prompt.get("client_system_prompt")
+                if isinstance(value, str):
+                    next_client_system_prompt = value
+            else:
+                next_prompt = queued_prompt
             if conn:
                 await conn.session_update(
                     session_id,
                     acp.update_user_message_text(next_prompt),
                 )
+            next_kwargs: dict[str, Any] = {}
+            if next_client_system_prompt is not None:
+                next_kwargs["hermes"] = {"systemPrompt": next_client_system_prompt}
             await self.prompt(
                 prompt=[TextContentBlock(type="text", text=next_prompt)],
                 session_id=session_id,
+                **next_kwargs,
             )
 
         usage = None

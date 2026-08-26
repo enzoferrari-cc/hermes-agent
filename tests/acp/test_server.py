@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock, AsyncMock, patch
 
@@ -43,6 +44,9 @@ from acp_adapter.server import (
 )
 from acp_adapter.session import SessionManager
 from hermes_state import SessionDB
+
+
+_MISSING = object()
 
 
 @pytest.fixture()
@@ -402,6 +406,40 @@ class TestSessionConfiguration:
 
 
 class TestPrompt:
+    async def _capture_prompt(
+        self,
+        agent,
+        mock_manager,
+        *,
+        existing_prompt: str | None = None,
+        client_prompt: object = _MISSING,
+    ) -> dict[str, object]:
+        resp = await agent.new_session(cwd=".")
+        state = mock_manager.get_session(resp.session_id)
+        state.agent.ephemeral_system_prompt = existing_prompt
+        captured: dict[str, object] = {}
+
+        def _run(*_args, **kwargs):
+            captured["user_message"] = kwargs.get("user_message")
+            captured["ephemeral"] = state.agent.ephemeral_system_prompt
+            return {"final_response": "ok", "messages": []}
+
+        state.agent.run_conversation = _run
+        state.agent.model = "test-model"
+        state.agent.provider = "openrouter"
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        params: dict[str, object] = {
+            "sessionId": resp.session_id,
+            "prompt": [{"type": "text", "text": "hi"}],
+        }
+        if client_prompt is not _MISSING:
+            params["_meta"] = {"hermes": {"systemPrompt": client_prompt}}
+        await build_agent_router(agent)("session/prompt", params, False)
+        return captured
+
     @pytest.mark.asyncio
     async def test_prompt_returns_refusal_for_unknown_session(self, agent):
         prompt = [TextContentBlock(type="text", text="hello")]
@@ -445,6 +483,113 @@ class TestPrompt:
         )
 
         assert captured.get("child") == resp.session_id
+
+    @pytest.mark.asyncio
+    async def test_prompt_routes_client_system_prompt_out_of_band(self, agent, mock_manager):
+        captured = await self._capture_prompt(
+            agent,
+            mock_manager,
+            client_prompt="CLIENT SYSTEM PROMPT",
+        )
+
+        assert captured["user_message"] == "hi"
+        assert captured["ephemeral"] == "CLIENT SYSTEM PROMPT"
+
+    @pytest.mark.asyncio
+    async def test_prompt_without_client_system_prompt_preserves_existing_prompt(self, agent, mock_manager):
+        captured = await self._capture_prompt(
+            agent,
+            mock_manager,
+            existing_prompt="CLI SYSTEM PROMPT",
+        )
+
+        assert captured["ephemeral"] == "CLI SYSTEM PROMPT"
+
+    @pytest.mark.asyncio
+    async def test_prompt_empty_client_system_prompt_clears_existing_prompt(self, agent, mock_manager):
+        captured = await self._capture_prompt(
+            agent,
+            mock_manager,
+            existing_prompt="OLD CLIENT SYSTEM PROMPT",
+            client_prompt="",
+        )
+
+        assert captured["ephemeral"] is None
+
+    @pytest.mark.asyncio
+    async def test_prompt_ignores_non_string_client_system_prompt(self, agent, mock_manager):
+        captured = await self._capture_prompt(
+            agent,
+            mock_manager,
+            existing_prompt="CLI SYSTEM PROMPT",
+            client_prompt=["not", "a", "string"],
+        )
+
+        assert captured["ephemeral"] == "CLI SYSTEM PROMPT"
+
+    @pytest.mark.asyncio
+    async def test_queued_prompt_keeps_its_client_system_prompt(self, agent, mock_manager):
+        resp = await agent.new_session(cwd=".")
+        state = mock_manager.get_session(resp.session_id)
+        first_started = threading.Event()
+        release_first = threading.Event()
+        captured: list[object] = []
+
+        def _run(*_args, **_kwargs):
+            captured.append(state.agent.ephemeral_system_prompt)
+            if len(captured) == 1:
+                first_started.set()
+                assert release_first.wait(timeout=5)
+            return {"final_response": "ok", "messages": []}
+
+        state.agent.run_conversation = _run
+        state.agent.model = "test-model"
+        state.agent.provider = "openrouter"
+        state.agent._supports_active_turn_redirect = True
+        state.agent.redirect = MagicMock(return_value=True)
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        first = asyncio.create_task(
+            agent.prompt(
+                prompt=[TextContentBlock(type="text", text="first")],
+                session_id=resp.session_id,
+                hermes={"systemPrompt": "FIRST SYSTEM PROMPT"},
+            )
+        )
+        assert await asyncio.to_thread(first_started.wait, 5)
+        await agent.prompt(
+            prompt=[TextContentBlock(type="text", text="second")],
+            session_id=resp.session_id,
+            hermes={"systemPrompt": "SECOND SYSTEM PROMPT"},
+        )
+        release_first.set()
+        await first
+
+        assert captured == ["FIRST SYSTEM PROMPT", "SECOND SYSTEM PROMPT"]
+        state.agent.redirect.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_active_turn_redirect_keeps_matching_client_system_prompt(self, agent, mock_manager):
+        resp = await agent.new_session(cwd=".")
+        state = mock_manager.get_session(resp.session_id)
+        state.is_running = True
+        state.agent.ephemeral_system_prompt = "SAME SYSTEM PROMPT"
+        state.agent._supports_active_turn_redirect = True
+        state.agent.redirect = MagicMock(return_value=True)
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        await agent.prompt(
+            prompt=[TextContentBlock(type="text", text="correction")],
+            session_id=resp.session_id,
+            hermes={"systemPrompt": "SAME SYSTEM PROMPT"},
+        )
+
+        state.agent.redirect.assert_called_once_with("correction")
+        assert state.queued_prompts == []
 
 
 
