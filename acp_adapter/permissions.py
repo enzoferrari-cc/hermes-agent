@@ -113,11 +113,22 @@ def _map_outcome_to_hermes(outcome: object, *, allowed_option_ids: set[str]) -> 
     return _OPTION_ID_TO_HERMES.get(option_id, "deny")
 
 
+def _resolve_approval_timeout() -> float:
+    """Read Hermes' configured approval timeout for the next ACP prompt."""
+    try:
+        from tools.approval import _get_approval_timeout
+
+        return float(_get_approval_timeout())
+    except Exception:
+        logger.debug("Falling back to the ACP approval timeout", exc_info=True)
+        return 60.0
+
+
 def make_approval_callback(
     request_permission_fn: Callable,
     loop: asyncio.AbstractEventLoop,
     session_id: str,
-    timeout: float = 60.0,
+    timeout: float | None = None,
 ) -> Callable[..., str]:
     """
     Return a Hermes-compatible approval callback that bridges to ACP.
@@ -130,7 +141,8 @@ def make_approval_callback(
         request_permission_fn: The ACP connection's ``request_permission`` coroutine.
         loop: The event loop on which the ACP connection lives.
         session_id: Current ACP session id.
-        timeout: Seconds to wait for a response before auto-denying.
+        timeout: Explicit seconds to wait for a response. ``None`` reads
+            ``approvals.timeout`` for each permission prompt.
     """
 
     def _callback(
@@ -164,11 +176,13 @@ def make_approval_callback(
         if future is None:
             return "deny"
 
+        resolved_timeout = timeout if timeout is not None else _resolve_approval_timeout()
+
         try:
-            response = future.result(timeout=timeout)
+            response = future.result(timeout=resolved_timeout)
         except FutureTimeout:
             future.cancel()
-            logger.warning("Permission request timed out after %ss", timeout)
+            logger.warning("Permission request timed out after %ss", resolved_timeout)
             # Distinct from an explicit deny: the client never answered.
             # tools.approval callers report this as "timed out without user
             # response" instead of a user denial.

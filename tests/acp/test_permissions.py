@@ -3,7 +3,7 @@
 import asyncio
 import inspect
 from concurrent.futures import Future
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 from acp.schema import (
     AllowedOutcome,
@@ -66,6 +66,103 @@ def _invoke_callback(
 
 
 class TestApprovalBridge:
+    def test_explicit_timeout_bypasses_approval_config(self):
+        with patch("tools.approval._get_approval_timeout") as configured_timeout:
+            result, _, _, future, _ = _invoke_callback(
+                AllowedOutcome(option_id="allow_once", outcome="selected"),
+                timeout=12.0,
+            )
+
+        assert result == "once"
+        configured_timeout.assert_not_called()
+        future.result.assert_called_once_with(timeout=12.0)
+
+    def test_zero_config_timeout_remains_immediate_and_fail_closed(self):
+        loop = MagicMock(spec=asyncio.AbstractEventLoop)
+        request_permission = MagicMock(return_value=object())
+        future = MagicMock(spec=Future)
+        future.result.side_effect = TimeoutError("timed out")
+
+        with (
+            patch("agent.async_utils.asyncio.run_coroutine_threadsafe", return_value=future),
+            patch("tools.approval._get_approval_timeout", return_value=0),
+        ):
+            cb = make_approval_callback(request_permission, loop, session_id="s1")
+            result = cb("rm -rf /", "dangerous command")
+
+        assert result == "timeout"
+        future.result.assert_called_once_with(timeout=0.0)
+        future.cancel.assert_called_once_with()
+
+    def test_config_timeout_failure_falls_back_to_legacy_default(self):
+        loop = MagicMock(spec=asyncio.AbstractEventLoop)
+        request_permission = MagicMock(return_value=object())
+        future = MagicMock(spec=Future)
+        future.result.return_value = _make_response(
+            AllowedOutcome(option_id="allow_once", outcome="selected")
+        )
+
+        with (
+            patch("agent.async_utils.asyncio.run_coroutine_threadsafe", return_value=future),
+            patch("tools.approval._get_approval_timeout", side_effect=RuntimeError("bad config")),
+        ):
+            cb = make_approval_callback(request_permission, loop, session_id="s1")
+            result = cb("rm -rf /", "dangerous command")
+
+        assert result == "once"
+        future.result.assert_called_once_with(timeout=60.0)
+
+    def test_config_timeout_is_re_read_for_each_prompt(self):
+        loop = MagicMock(spec=asyncio.AbstractEventLoop)
+        request_permission = AsyncMock(name="request_permission")
+        future = MagicMock(spec=Future)
+        future.result.return_value = _make_response(
+            AllowedOutcome(option_id="allow_once", outcome="selected")
+        )
+        scheduled_coroutines = []
+
+        def _schedule(coro, _passed_loop):
+            scheduled_coroutines.append(coro)
+            return future
+
+        with (
+            patch("agent.async_utils.asyncio.run_coroutine_threadsafe", side_effect=_schedule),
+            patch("tools.approval._get_approval_timeout", side_effect=[300, 600]),
+        ):
+            cb = make_approval_callback(request_permission, loop, session_id="s1")
+            assert cb("first", "dangerous command") == "once"
+            assert cb("second", "dangerous command") == "once"
+
+        for coro in scheduled_coroutines:
+            coro.close()
+        assert future.result.call_args_list == [call(timeout=300.0), call(timeout=600.0)]
+
+    def test_default_timeout_uses_approval_config(self):
+        loop = MagicMock(spec=asyncio.AbstractEventLoop)
+        request_permission = AsyncMock(name="request_permission")
+        future = MagicMock(spec=Future)
+        future.result.return_value = _make_response(
+            AllowedOutcome(option_id="allow_once", outcome="selected")
+        )
+        scheduled = {}
+
+        def _schedule(coro, passed_loop):
+            scheduled["coro"] = coro
+            scheduled["loop"] = passed_loop
+            return future
+
+        with (
+            patch("agent.async_utils.asyncio.run_coroutine_threadsafe", side_effect=_schedule),
+            patch("tools.approval._get_approval_timeout", return_value=300) as configured_timeout,
+        ):
+            cb = make_approval_callback(request_permission, loop, session_id="s1")
+            result = cb("rm -rf /", "dangerous command")
+
+        scheduled["coro"].close()
+        assert result == "once"
+        configured_timeout.assert_called_once_with()
+        future.result.assert_called_once_with(timeout=300.0)
+
     def test_bridge_schedules_request_on_the_given_loop(self):
         result, kwargs, scheduled, _, loop = _invoke_callback(
             AllowedOutcome(option_id="allow_once", outcome="selected"),
