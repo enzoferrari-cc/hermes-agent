@@ -778,7 +778,8 @@ class HermesACPAgent(acp.Agent):
 
             available_models: list[ModelInfo] = []
             seen_ids: set[str] = set()
-            current_choice_provider = str(provider or "").strip().lower()
+            requested_provider = getattr(state.agent, "requested_provider", None)
+            current_choice_provider = str(requested_provider or provider or "").strip().lower()
             if current_choice_provider == "ollama":
                 current_choice_provider = "custom:ollama"
             current_base_url = str(
@@ -885,7 +886,7 @@ class HermesACPAgent(acp.Agent):
                     named_parts = [f"Provider: {named_label}"]
                     if named_desc:
                         named_parts.append(str(named_desc).strip())
-                    if named_slug == normalized_provider and named_model == model:
+                    if named_slug == current_choice_provider and named_model == model:
                         named_parts.append("current")
                     available_models.append(
                         ModelInfo(
@@ -1632,7 +1633,13 @@ class HermesACPAgent(acp.Agent):
     ) -> LoadSessionResponse | None:
         state = self.session_manager.update_cwd(session_id, cwd)
         if state is None:
-            logger.warning("load_session: session %s not found", session_id)
+            # `update_cwd` → `get_session` → `_restore` returns None for BOTH a
+            # genuinely missing session and a session whose agent could not be
+            # rebuilt (e.g. its named provider is unavailable). The latter logs
+            # a distinct error inside `_restore`; this line only records the
+            # surfaced outcome. Keep it accurate: the session may exist but be
+            # unrestorable, which is not the same as "not found".
+            logger.warning("load_session: session %s not found or not restorable", session_id)
             return None
         await self._register_session_mcp_servers(state, mcp_servers)
         self._schedule_mcp_late_refresh(state)

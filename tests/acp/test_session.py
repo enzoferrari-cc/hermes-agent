@@ -449,3 +449,187 @@ class TestPersistence:
 
         assert stdout_buf.getvalue() == ""
         assert stderr_buf.getvalue() == "ACP noise\n"
+
+
+# ---------------------------------------------------------------------------
+# named custom provider identity across process restarts
+# ---------------------------------------------------------------------------
+
+
+def _fake_named_runtime_resolver(captured):
+    def fake_resolve_runtime_provider(requested=None, **kwargs):
+        captured["resolve_requested"] = requested
+        resolved_base_url = (
+            "https://openrouter.example/v1"
+            if requested == "openrouter"
+            else "https://autodl.example/v1"
+        )
+        return {
+            "provider": "custom",
+            "requested_provider": requested,
+            "api_mode": "chat_completions",
+            "base_url": resolved_base_url,
+            "api_key": "no-key-required",
+        }
+
+    return fake_resolve_runtime_provider
+
+
+class _CapturingAgent:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.model = kwargs.get("model")
+        self.provider = kwargs.get("provider")
+        self.requested_provider = kwargs.get("requested_provider")
+        self.base_url = kwargs.get("base_url")
+        self.api_mode = kwargs.get("api_mode")
+        self.api_key = kwargs.get("api_key")
+
+
+class TestNamedCustomProviderRestore:
+    def _setup(self, monkeypatch, tmp_path):
+        captured = {}
+
+        monkeypatch.setattr("run_agent.AIAgent", _CapturingAgent)
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"model": {"provider": "custom", "default": "qwen3.8-27b"}},
+        )
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            _fake_named_runtime_resolver(captured),
+        )
+        monkeypatch.setattr(
+            "hermes_cli.mcp_startup.ensure_mcp_discovery_before_agent_build",
+            lambda **kwargs: None,
+        )
+
+        db = SessionDB(tmp_path / "state.db")
+        return db, captured
+
+    def test_restore_keeps_named_billing_provider_over_bare_model_config(self, monkeypatch, tmp_path):
+        """A named custom provider must not be downgraded to bare ``custom``."""
+        db, captured = self._setup(monkeypatch, tmp_path)
+        db.create_session(
+            session_id="sess-1",
+            source="acp",
+            model="qwen3.8-27b",
+            model_config={"cwd": "/work", "provider": "custom"},
+        )
+        db.update_token_counts(
+            "sess-1",
+            input_tokens=10,
+            output_tokens=5,
+            billing_provider="custom:autodl",
+            billing_base_url="https://autodl.example/v1",
+        )
+
+        manager = SessionManager(db=db)
+        state = manager.get_session("sess-1")
+
+        assert state is not None
+        assert captured["resolve_requested"] == "custom:autodl"
+        assert state.agent.requested_provider == "custom:autodl"
+        assert state.agent.base_url == "https://autodl.example/v1"
+
+    def test_restore_uses_persisted_requested_provider_when_present(self, monkeypatch, tmp_path):
+        """A persisted precise ``requested_provider`` wins over a bare ``provider``."""
+        db, captured = self._setup(monkeypatch, tmp_path)
+        db.create_session(
+            session_id="sess-2",
+            source="acp",
+            model="qwen3.8-27b",
+            model_config={
+                "cwd": "/work",
+                "provider": "custom",
+                "requested_provider": "custom:autodl",
+            },
+        )
+
+        manager = SessionManager(db=db)
+        state = manager.get_session("sess-2")
+
+        assert state is not None
+        assert captured["resolve_requested"] == "custom:autodl"
+
+    def test_restore_prefers_current_non_custom_provider_over_stale_named_billing(self, monkeypatch, tmp_path):
+        """Stale billing metadata must not override a later provider switch."""
+        db, captured = self._setup(monkeypatch, tmp_path)
+        db.create_session(
+            session_id="sess-switched",
+            source="acp",
+            model="qwen3.8-27b",
+            model_config={"cwd": "/work", "provider": "openrouter"},
+        )
+        db.update_token_counts(
+            "sess-switched",
+            input_tokens=10,
+            output_tokens=5,
+            billing_provider="custom:autodl",
+            billing_base_url="https://autodl.example/v1",
+        )
+
+        manager = SessionManager(db=db)
+        state = manager.get_session("sess-switched")
+
+        assert state is not None
+        assert captured["resolve_requested"] == "openrouter"
+        assert state.agent.base_url == "https://openrouter.example/v1"
+
+    def test_restore_uses_current_base_url_with_current_provider(self, monkeypatch, tmp_path):
+        """Current model metadata must replace the stale billing route atomically."""
+        db, captured = self._setup(monkeypatch, tmp_path)
+        db.create_session(
+            session_id="sess-current-route",
+            source="acp",
+            model="qwen3.8-27b",
+            model_config={
+                "cwd": "/work",
+                "provider": "openrouter",
+                "base_url": "https://current-openrouter.example/v1",
+            },
+        )
+        db.update_token_counts(
+            "sess-current-route",
+            input_tokens=10,
+            output_tokens=5,
+            billing_provider="custom:autodl",
+            billing_base_url="https://autodl.example/v1",
+        )
+
+        manager = SessionManager(db=db)
+        state = manager.get_session("sess-current-route")
+
+        assert state is not None
+        assert captured["resolve_requested"] == "openrouter"
+        assert state.agent.base_url == "https://current-openrouter.example/v1"
+
+    def test_make_agent_passes_requested_provider_to_agent(self, monkeypatch, tmp_path):
+        """_make_agent must propagate the precise identity into the agent."""
+        db, captured = self._setup(monkeypatch, tmp_path)
+
+        manager = SessionManager(db=db)
+        agent = manager._make_agent(
+            session_id="sess-3",
+            cwd="/work",
+            requested_provider="custom:autodl",
+        )
+
+        assert agent.requested_provider == "custom:autodl"
+
+    def test_persist_records_named_requested_provider(self, monkeypatch, tmp_path):
+        """_persist must persist the precise identity, not only the base type."""
+        db, captured = self._setup(monkeypatch, tmp_path)
+
+        manager = SessionManager(db=db)
+        state = manager.create_session(cwd="/work")
+        state.agent.provider = "custom"
+        state.agent.requested_provider = "custom:autodl"
+        state.agent.base_url = "https://autodl.example/v1"
+        state.agent.api_mode = "chat_completions"
+        manager.save_session(state.session_id)
+
+        row = db.get_session(state.session_id)
+        meta = json.loads(row["model_config"])
+        assert meta.get("requested_provider") == "custom:autodl"
+        assert meta.get("provider") == "custom"

@@ -26,6 +26,18 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 
+def _is_named_custom_provider(provider: str | None) -> bool:
+    """True when a provider string is a named custom endpoint (``custom:<name>``).
+
+    A bare ``custom`` is a category, not a routable identity: it has no single
+    endpoint or credential. A named form such as ``custom:autodl`` resolves to a
+    specific ``providers:`` / ``custom_providers:`` entry. Persisting and restoring
+    the named form is what lets a resumed session rebind to the endpoint that
+    actually served it (see the resume-priority fix in ``_restore``).
+    """
+    return (provider or "").strip().lower().startswith("custom:")
+
+
 def _translate_acp_cwd(cwd: str) -> str:
     """Translate Windows ACP cwd values when Hermes itself is running in WSL.
 
@@ -454,10 +466,15 @@ class SessionManager:
         model_str = str(state.model) if state.model else None
         session_meta = {"cwd": state.cwd}
         provider = getattr(state.agent, "provider", None)
+        requested_provider = getattr(state.agent, "requested_provider", None)
         base_url = getattr(state.agent, "base_url", None)
         api_mode = getattr(state.agent, "api_mode", None)
         if isinstance(provider, str) and provider.strip():
             session_meta["provider"] = provider.strip()
+        # Persist the precise route identity so a later cross-process restore
+        # rebinds to the exact named endpoint instead of the bare base type.
+        if isinstance(requested_provider, str) and requested_provider.strip():
+            session_meta["requested_provider"] = requested_provider.strip()
         if isinstance(base_url, str) and base_url.strip():
             session_meta["base_url"] = base_url.strip()
         if isinstance(api_mode, str) and api_mode.strip():
@@ -546,7 +563,8 @@ class SessionManager:
         # Sessions are shared across interfaces. The source records provenance,
         # not whether the ACP adapter may resume the persisted conversation.
         cwd = _row_cwd(row)
-        requested_provider = row.get("billing_provider")
+        billing_provider = row.get("billing_provider")
+        requested_provider = billing_provider
         restored_base_url = row.get("billing_base_url")
         restored_api_mode = None
         mc = row.get("model_config")
@@ -554,7 +572,35 @@ class SessionManager:
             try:
                 meta = json.loads(mc)
                 if isinstance(meta, dict):
-                    requested_provider = meta.get("provider") or requested_provider
+                    # Precise identity wins over a bare category. The billing
+                    # column carries the exact route that served the session
+                    # (``custom:autodl``); the legacy ``model_config.provider``
+                    # stores the *base* type (``custom``). A bare ``custom`` must
+                    # never downgrade a named ``custom:<name>``, or a resumed
+                    # session loses its endpoint and fails credential resolution.
+                    mc_requested = meta.get("requested_provider")
+                    mc_provider = meta.get("provider")
+                    selected_meta_provider = None
+                    if mc_requested:
+                        selected_meta_provider = mc_requested
+                    elif mc_provider and not (
+                        _is_named_custom_provider(requested_provider)
+                        and str(mc_provider).strip().lower() == "custom"
+                    ):
+                        selected_meta_provider = mc_provider
+                    if selected_meta_provider:
+                        # Provider identity and endpoint metadata are one route.
+                        # If current model metadata selects a different provider,
+                        # never combine it with a stale billing URL from the old
+                        # provider. With no current base_url, _make_agent must use
+                        # the newly selected provider's resolved endpoint.
+                        if (
+                            not billing_provider
+                            or str(selected_meta_provider).strip().lower()
+                            != str(billing_provider).strip().lower()
+                        ):
+                            restored_base_url = None
+                        requested_provider = selected_meta_provider
                     restored_base_url = meta.get("base_url") or restored_base_url
                     restored_api_mode = meta.get("api_mode") or restored_api_mode
             except (json.JSONDecodeError, TypeError):
@@ -585,7 +631,18 @@ class SessionManager:
                 api_mode=restored_api_mode,
             )
         except Exception:
-            logger.warning("Failed to recreate agent for ACP session %s", session_id, exc_info=True)
+            # The session row exists and its transcript is intact — only the
+            # agent could not be rebuilt. Log it distinctly from a genuine
+            # "session not found" so an operator can tell the two apart in the
+            # daemon log. `requested_provider` is a routable identity (e.g.
+            # ``custom:autodl``), never a credential, so it is safe to log.
+            logger.error(
+                "ACP session %s exists in the database but its agent could not "
+                "be recreated (provider=%r); resume will fail closed",
+                session_id,
+                requested_provider,
+                exc_info=True,
+            )
             return None
 
         state = SessionState(
@@ -669,6 +726,13 @@ class SessionManager:
             kwargs.update(
                 {
                     "provider": runtime.get("provider"),
+                    # Preserve the precise route identity (e.g. ``custom:autodl``)
+                    # alongside the canonical base type (``custom``). The agent
+                    # stores it on ``requested_provider`` and ``_persist`` writes
+                    # it back, so a resumed session rebinds to the exact endpoint.
+                    "requested_provider": requested_provider
+                    or runtime.get("requested_provider")
+                    or runtime.get("provider"),
                     "api_mode": api_mode or runtime.get("api_mode"),
                     "base_url": base_url or runtime.get("base_url"),
                     "api_key": runtime.get("api_key"),

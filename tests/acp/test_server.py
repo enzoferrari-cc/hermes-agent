@@ -250,6 +250,32 @@ class TestSessionOps:
             max_models=ACP_MAX_MODELS_PER_PROVIDER,
         )
 
+    @pytest.mark.asyncio
+    async def test_model_state_reports_precise_named_provider_identity(self):
+        manager = SessionManager(
+            agent_factory=lambda: SimpleNamespace(
+                model="qwen3.8-27b",
+                provider="custom",
+                requested_provider="custom:autodl",
+                base_url="https://autodl.example/v1",
+            )
+        )
+        acp_agent = HermesACPAgent(session_manager=manager)
+        picker_context = MagicMock()
+        picker_context.with_overrides.return_value = picker_context
+
+        with (
+            patch("hermes_cli.inventory.load_picker_context", return_value=picker_context),
+            patch("hermes_cli.inventory.build_models_payload", return_value={"providers": []}),
+            patch(
+                "acp_adapter.server._named_custom_provider_catalogs",
+                return_value=[("custom:autodl", "autodl", [("qwen3.8-27b", "")])],
+            ),
+        ):
+            resp = await acp_agent.new_session(cwd="/tmp")
+
+        assert isinstance(resp.models, SessionModelState)
+        assert resp.models.current_model_id == "custom:autodl:qwen3.8-27b"
 
 
     @pytest.mark.asyncio
