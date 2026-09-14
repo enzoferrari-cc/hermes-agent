@@ -1,0 +1,185 @@
+name: Fork standard-runner validation
+
+# Fork-only validation for repositories that do not have the upstream
+# organization's 96-core/32-core runner labels. This keeps the test commands
+# and coverage intact while changing only how work is distributed.
+on:
+  pull_request:
+    branches:
+      - candidate/local-hermes-a406-acp-persistence
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-standard-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  generate_python_slices:
+    name: Generate full-suite slices
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Generate eight complete-suite slices
+        id: matrix
+        shell: bash
+        run: |
+          matrix=$(python3 scripts/run_tests_parallel.py --generate-slices 8)
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  full-python:
+    name: Full Python suite slice ${{ matrix.slice.index }}/8
+    needs: generate_python_slices
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.generate_python_slices.outputs.matrix) }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install ripgrep (prebuilt binary)
+        shell: bash
+        run: |
+          set -euo pipefail
+          RG_VERSION=15.1.0
+          RG_SHA256=1c9297be4a084eea7ecaedf93eb03d058d6faae29bbc57ecdaf5063921491599
+          RG_TARBALL=ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl.tar.gz
+          curl -sSfL --retry 3 --retry-delay 5 -o "$RG_TARBALL" \
+            "https://github.com/BurntSushi/ripgrep/releases/download/${RG_VERSION}/${RG_TARBALL}"
+          echo "${RG_SHA256}  ${RG_TARBALL}" | sha256sum -c -
+          tar -xzf "$RG_TARBALL"
+          sudo mv "ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl/rg" /usr/local/bin/rg
+          rm -rf "$RG_TARBALL" "ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl"
+          rg --version
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          version: "0.9.28"
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Set up Python 3.11
+        uses: ./.github/actions/retry
+        with:
+          command: uv python install 3.11
+
+      - name: Install dependencies
+        uses: ./.github/actions/retry
+        with:
+          command: uv sync --locked --python 3.11 --extra all --extra dev --extra anthropic --extra mistral --extra fal --extra modal --extra daytona --extra hindsight --extra parallel-web
+
+      - name: Minimize uv cache
+        run: uv cache prune --ci
+
+      - name: Run complete-suite slice
+        shell: bash
+        run: |
+          source .venv/bin/activate
+          scripts/run_tests.sh --files '${{ matrix.slice.files }}'
+        env:
+          HERMES_TEST_WORKERS: 4
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+
+  windows-only:
+    name: Windows-only tests on standard runner
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          version: "0.9.28"
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Set up Python 3.11
+        uses: ./.github/actions/retry
+        with:
+          command: uv python install 3.11
+
+      - name: Install dependencies
+        uses: ./.github/actions/retry
+        with:
+          command: uv sync --locked --python 3.11 --extra all --extra dev --extra anthropic --extra mistral --extra fal --extra modal --extra daytona --extra hindsight --extra parallel-web
+
+      - name: Minimize uv cache
+        run: uv cache prune --ci
+
+      - name: Run Windows-only tests
+        shell: bash
+        run: |
+          set -uo pipefail
+          LIST="${RUNNER_TEMP:-.}/selected-tests.txt"
+          if ! uv run --no-sync python scripts/ci/list_os_marked_tests.py windows_only > "$LIST"; then
+            echo "::error::could not enumerate windows_only test files"
+            exit 1
+          fi
+          if [ ! -s "$LIST" ]; then
+            echo "::error::empty windows_only file list"
+            exit 1
+          fi
+          set -- $(cat "$LIST")
+          echo "selected $# file(s) for windows_only:"
+          cat "$LIST"
+          status=0
+          uv run --no-sync python -m pytest \
+            "$@" \
+            --ignore-glob='*test_desktop_update_windows_*.py' \
+            -m "windows_only and not integration" \
+            -v --tb=short || status=$?
+          if [ "$status" -eq 5 ]; then
+            echo "::error::No tests matched -m windows_only"
+            exit 1
+          fi
+          exit "$status"
+        env:
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+
+  nix-flake:
+    name: Nix flake check on standard runner
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31.11.0
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            fallback = true
+            tarball-ttl = 3600
+
+      - name: Restore Nix store
+        uses: nix-community/cache-nix-action@7df957e333c1e5da7721f60227dbba6d06080569 # v7
+        with:
+          primary-key: fork-nix-${{ runner.os }}-${{ hashFiles('flake.lock', 'nix/**', 'pyproject.toml', 'uv.lock') }}
+          restore-prefixes-first-match: |
+            fork-nix-${{ runner.os }}-
+            nix-${{ runner.os }}-
+          save: false
+          gc-max-store-size-linux: 5G
+
+      - name: Run the repository flake check
+        run: nix flake check --print-build-logs
