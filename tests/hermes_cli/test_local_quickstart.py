@@ -17,6 +17,23 @@ import pytest
 from fastapi.testclient import TestClient
 
 
+@pytest.fixture(autouse=True)
+def quickstart_machine_budget(monkeypatch):
+    """Keep route-contract tests independent of the CI runner's RAM size."""
+    from hermes_cli.local_runtime.estimator import HardwareBudget
+
+    gib = 1 << 30
+    budget = HardwareBudget(
+        usable_vram_bytes=64 * gib,
+        total_device_bytes=64 * gib,
+        ram_available_bytes=64 * gib,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.local_runtime.hardware.probe_budget",
+        lambda **_kwargs: budget,
+    )
+
+
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
