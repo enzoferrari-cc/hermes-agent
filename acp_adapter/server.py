@@ -2548,6 +2548,12 @@ class HermesACPAgent(acp.Agent):
             approx_tokens = estimate_request_tokens_rough(
                 state.history, system_prompt=_sys_prompt, tools=_tools
             )
+            expects_durable_commit = getattr(agent, "_session_db", None) is not None
+            if expects_durable_commit:
+                # Slash commands do not pass through the ordinary per-turn
+                # reset. Clear a prior success before using this flag as the
+                # current commit receipt.
+                agent._last_compaction_in_place = False
             compressed, _ = agent._compress_context(
                 state.history,
                 getattr(agent, "_cached_system_prompt", "") or "",
@@ -2555,6 +2561,11 @@ class HermesACPAgent(acp.Agent):
                 task_id=state.session_id,
                 force=True,
             )
+            if (
+                expects_durable_commit
+                and getattr(agent, "_last_compaction_in_place", False) is not True
+            ):
+                return "Compression failed: compacted history was not committed."
 
             state.history = compressed
             self.session_manager.save_session(state.session_id)
